@@ -4,6 +4,8 @@ import cv2
 import numpy as np 
 import RPi.GPIO as GPIO 
 from picamera2 import Picamera2 
+import threading
+from collections import deque
 
 # --- GPIO SETUP --- 
 GPIO.setmode(GPIO.BCM) 
@@ -26,17 +28,29 @@ detection_frames = 0
 COOLDOWN_UNTIL = 0     
 stop_until = 0     
 
+# Threading Globals
+frame_buffer = deque(maxlen=1)
+running = True
+
+# --- NEW HSV THRESHOLDS ---
+HSV_THRESHOLDS = {
+    "black":  {"low": np.array([0, 0, 0]),     "high": np.array([180, 255, 60])},
+    "yellow": {"low": np.array([20, 100, 100]), "high": np.array([35, 255, 255])},
+    "red1":   {"low": np.array([0, 100, 100]),  "high": np.array([10, 255, 255])},
+    "red2":   {"low": np.array([160, 100, 100]), "high": np.array([180, 255, 255])}
+}
+
 # States 
 STATE_FOLLOWING = 0 
 STATE_STOPPED = 1 
 STATE_FORCED_TURN = 2 
-STATE_RECYCLING = 3  # New state for 360 rotation
+STATE_RECYCLING = 3 
 
 current_state = STATE_FOLLOWING 
 forced_turn_side = None 
 forced_turn_until = 0 
 recycle_until = 0 
-RECYCLE_DURATION = 1.8  # Adjust this time to complete exactly 360 degrees
+RECYCLE_DURATION = 1.8 
 
 # Initialize ORB 
 orb = cv2.ORB_create(nfeatures=500) 
@@ -98,8 +112,9 @@ def detect_and_crop_symbol(frame_rgb):
     H, W, _ = frame_rgb.shape 
     roi = frame_rgb[0:int(H * ROI_START), :]  
     hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV) 
-    lower_color = np.array([0, 70, 130]); upper_color = np.array([180, 255, 255]) 
-    color_mask = cv2.medianBlur(cv2.inRange(hsv, lower_color, upper_color), 5)  
+    
+    color_mask = cv2.medianBlur(cv2.inRange(hsv, HSV_THRESHOLDS["black"]["low"], HSV_THRESHOLDS["black"]["high"]), 5)  
+    
     gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY) 
     bin_inv = cv2.adaptiveThreshold(cv2.GaussianBlur(gray, (5, 5), 0), 255,   
                                     cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5) 
@@ -118,9 +133,11 @@ def detect_and_crop_symbol(frame_rgb):
 def get_line_error(frame_rgb): 
     small = cv2.resize(frame_rgb, (160, 120)) 
     hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV) 
-    m1 = cv2.inRange(hsv, np.array([0, 100, 100]), np.array([10, 255, 255])) 
-    m2 = cv2.inRange(hsv, np.array([160, 100, 100]), np.array([180, 255, 255])) 
-    m3 = cv2.inRange(hsv, np.array([20, 100, 100]), np.array([40, 255, 255])) 
+    
+    m1 = cv2.inRange(hsv, HSV_THRESHOLDS["red1"]["low"], HSV_THRESHOLDS["red1"]["high"]) 
+    m2 = cv2.inRange(hsv, HSV_THRESHOLDS["red2"]["low"], HSV_THRESHOLDS["red2"]["high"]) 
+    m3 = cv2.inRange(hsv, HSV_THRESHOLDS["yellow"]["low"], HSV_THRESHOLDS["yellow"]["high"]) 
+    
     mask = cv2.bitwise_or(cv2.bitwise_or(m1, m2), m3) 
     line_roi = mask[70:120, 0:160] 
      
@@ -136,6 +153,13 @@ def get_line_error(frame_rgb):
         return error, M['m00']/255, line_roi 
     return None, 0, line_roi 
 
+# --- THREADED CAPTURE ---
+def capture_thread(picam2):
+    global running
+    while running:
+        frame = picam2.capture_array()
+        frame_buffer.append(frame)
+
 # --- MAIN LOOP --- 
 templates = load_templates() 
 picam2 = Picamera2() 
@@ -144,12 +168,19 @@ config['buffer_count'] = 1
 picam2.configure(config) 
 picam2.start() 
 
+# Start Camera Thread
+cam_t = threading.Thread(target=capture_thread, args=(picam2,), daemon=True)
+cam_t.start()
+
 print(f"Ready. Templates: {list(templates.keys())}") 
 input(">>> Press ENTER to start") 
 
 try: 
     while True: 
-        frame = picam2.capture_array() 
+        if not frame_buffer:
+            continue
+            
+        frame = frame_buffer[0]
         now = time.time() 
         crop_mask, symbol_box, bin_clean, best_contour = detect_and_crop_symbol(frame) 
 
@@ -208,9 +239,12 @@ try:
         elif current_state == STATE_FORCED_TURN: 
             small = cv2.resize(frame, (160, 120)) 
             hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV) 
-            mask = cv2.bitwise_or(cv2.bitwise_or(cv2.inRange(hsv, np.array([0,100,100]), np.array([10,255,255])), 
-                                                 cv2.inRange(hsv, np.array([160,100,100]), np.array([180,255,255]))),
-                                  cv2.inRange(hsv, np.array([20,100,100]), np.array([40,255,255])))
+            
+            m_r1 = cv2.inRange(hsv, HSV_THRESHOLDS["red1"]["low"], HSV_THRESHOLDS["red1"]["high"])
+            m_r2 = cv2.inRange(hsv, HSV_THRESHOLDS["red2"]["low"], HSV_THRESHOLDS["red2"]["high"])
+            m_y = cv2.inRange(hsv, HSV_THRESHOLDS["yellow"]["low"], HSV_THRESHOLDS["yellow"]["high"])
+            mask = cv2.bitwise_or(cv2.bitwise_or(m_r1, m_r2), m_y)
+            
             roi = mask[70:120, 0:80] if forced_turn_side == "left" else mask[70:120, 80:160] 
             if cv2.countNonZero(roi) > 400: 
                 forced_turn_side = None 
@@ -224,8 +258,7 @@ try:
                 current_state = STATE_FOLLOWING 
 
         elif current_state == STATE_RECYCLING:
-            # Pivot 360 degrees blindly
-            last_error = 40 # Force a pivot direction
+            last_error = 40 
             move_robot(None, 0)
             if now >= recycle_until:
                 COOLDOWN_UNTIL = now + 2.0
@@ -235,7 +268,5 @@ try:
         if cv2.waitKey(1) & 0xFF == ord('q'): break 
 
 finally: 
-    stop_motors(); 
-    picam2.stop(); 
-    GPIO.cleanup(); 
-    cv2.destroyAllWindows()
+    running = False
+    stop_motors(); picam2.stop(); GPIO.cleanup(); cv2.destroyAllWindows()
