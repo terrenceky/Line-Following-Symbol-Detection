@@ -17,22 +17,27 @@ pwmA.start(0); pwmB.start(0)
 
 # --- SETTINGS & GLOBALS --- 
 last_error = 0 
+color_entry_side = None  # Memory for Left-In/Left-Out recovery
 SAVE_DIR = "templates" 
 os.makedirs(SAVE_DIR, exist_ok=True) 
 
 GOOD_MATCH_DIST = 50 
 MIN_MATCH_COUNT = 10 
-ROI_START = 0.55       
+ROI_START = 0.55         
 REQUIRED_FRAMES = 5    
 detection_frames = 0   
 COOLDOWN_UNTIL = 0     
 stop_until = 0     
 
+# Thresholds for switching logic
+COLOR_THRESHOLD = 800  # Min pixels to prioritize color following
+BLACK_THRESHOLD = 500  # Min pixels to consider black line valid
+
 # Threading Globals
 frame_buffer = deque(maxlen=1)
 running = True
 
-# --- NEW HSV THRESHOLDS ---
+# --- HSV THRESHOLDS ---
 HSV_THRESHOLDS = {
     "black":  {"low": np.array([0, 0, 0]),     "high": np.array([180, 255, 60])},
     "yellow": {"low": np.array([20, 100, 100]), "high": np.array([35, 255, 255])},
@@ -137,23 +142,35 @@ def get_line_error(frame_rgb):
     m1 = cv2.inRange(hsv, HSV_THRESHOLDS["red1"]["low"], HSV_THRESHOLDS["red1"]["high"]) 
     m2 = cv2.inRange(hsv, HSV_THRESHOLDS["red2"]["low"], HSV_THRESHOLDS["red2"]["high"]) 
     m3 = cv2.inRange(hsv, HSV_THRESHOLDS["yellow"]["low"], HSV_THRESHOLDS["yellow"]["high"]) 
+    color_mask = cv2.bitwise_or(cv2.bitwise_or(m1, m2), m3) 
     
-    mask = cv2.bitwise_or(cv2.bitwise_or(m1, m2), m3) 
-    line_roi = mask[70:120, 0:160] 
-     
-    left_count = cv2.countNonZero(line_roi[:, 0:80]) 
-    right_count = cv2.countNonZero(line_roi[:, 80:160]) 
-     
-    M = cv2.moments(line_roi) 
-    if M['m00'] > 500: 
-        if (left_count + right_count) > 2500: # Junction 
-            error = -40 if left_count > right_count else 40 
-        else: 
-            error = int(M['m10'] / M['m00']) - 80 
-        return error, M['m00']/255, line_roi 
-    return None, 0, line_roi 
+    black_mask = cv2.inRange(hsv, HSV_THRESHOLDS["black"]["low"], HSV_THRESHOLDS["black"]["high"])
+    
+    color_roi = color_mask[70:120, 0:160] 
+    black_roi = black_mask[70:120, 0:160]
+    
+    c_px = cv2.countNonZero(color_roi)
+    b_px = cv2.countNonZero(black_roi)
+    
+    if c_px > COLOR_THRESHOLD:
+        active_roi = color_roi
+    elif b_px > BLACK_THRESHOLD:
+        active_roi = black_roi
+    else:
+        return None, 0, color_roi 
 
-# --- THREADED CAPTURE ---
+    M = cv2.moments(active_roi) 
+    if M['m00'] > 0: 
+        error = int(M['m10'] / M['m00']) - 80 
+        
+        left_count = cv2.countNonZero(active_roi[:, 0:80]) 
+        right_count = cv2.countNonZero(active_roi[:, 80:160]) 
+        if (left_count + right_count) > 2500: 
+            error = -40 if left_count > right_count else 40 
+            
+        return error, M['m00']/255, active_roi 
+    return None, 0, active_roi 
+
 def capture_thread(picam2):
     global running
     while running:
@@ -168,7 +185,6 @@ config['buffer_count'] = 1
 picam2.configure(config) 
 picam2.start() 
 
-# Start Camera Thread
 cam_t = threading.Thread(target=capture_thread, args=(picam2,), daemon=True)
 cam_t.start()
 
@@ -184,7 +200,20 @@ try:
         now = time.time() 
         crop_mask, symbol_box, bin_clean, best_contour = detect_and_crop_symbol(frame) 
 
+        # --- PRE-PROCESS COLOR FOR PIXEL CENSUS ---
+        small = cv2.resize(frame, (160, 120))
+        hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
+        m_r1 = cv2.inRange(hsv, HSV_THRESHOLDS["red1"]["low"], HSV_THRESHOLDS["red1"]["high"])
+        m_r2 = cv2.inRange(hsv, HSV_THRESHOLDS["red2"]["low"], HSV_THRESHOLDS["red2"]["high"])
+        m_y = cv2.inRange(hsv, HSV_THRESHOLDS["yellow"]["low"], HSV_THRESHOLDS["yellow"]["high"])
+        color_mask = cv2.bitwise_or(cv2.bitwise_or(m_r1, m_r2), m_y)
+        
+        left_px = cv2.countNonZero(color_mask[70:120, 0:80])
+        right_px = cv2.countNonZero(color_mask[70:120, 80:160])
+        total_color = left_px + right_px
+
         if current_state == STATE_FOLLOWING: 
+            # 1. CHECK FOR TASK A: ARROWS
             if best_contour is not None and now > COOLDOWN_UNTIL: 
                 detection_frames += 1 
                 if detection_frames >= REQUIRED_FRAMES: 
@@ -198,71 +227,74 @@ try:
                                 good = [m for m in matches if m.distance < GOOD_MATCH_DIST] 
                                 if len(good) > max_matches: 
                                     max_matches = len(good); best_name = name 
-                     
+
                     if max_matches > MIN_MATCH_COUNT: 
-                        print(f"MATCH: {best_name}") 
                         name_low = best_name.lower()
-                        
-                        if "recycle" in name_low:
-                            recycle_until = now + RECYCLE_DURATION
-                            current_state = STATE_RECYCLING
-                        elif "danger" in name_low or "button" in name_low:
-                            stop_until = now + 5.0
-                            current_state = STATE_STOPPED
-                        elif "left" in name_low: 
-                            forced_turn_side = "left" 
-                            stop_until = now + 1.2 
-                            current_state = STATE_STOPPED
+                        print(f"TASK A MATCH: {best_name}")
+                        if "left" in name_low: 
+                            forced_turn_side = "left"; stop_until = now + 1.2; current_state = STATE_STOPPED
                         elif "right" in name_low: 
-                            forced_turn_side = "right" 
-                            stop_until = now + 1.2 
-                            current_state = STATE_STOPPED
+                            forced_turn_side = "right"; stop_until = now + 1.2; current_state = STATE_STOPPED
+                        elif "recycle" in name_low:
+                            recycle_until = now + RECYCLE_DURATION; current_state = STATE_RECYCLING
+                        elif "danger" in name_low or "button" in name_low:
+                            stop_until = now + 5.0; current_state = STATE_STOPPED
                         else: 
-                            stop_until = now + 2.0 
-                            current_state = STATE_STOPPED
+                            stop_until = now + 2.0; current_state = STATE_STOPPED
                     detection_frames = 0 
+            
+            # 2. CHECK FOR TASK B: COLOR LINE CENSUS (Integrated Memory Logic)
+            elif total_color > 600 and now > COOLDOWN_UNTIL:
+                # Capture entry side memory (Left-In/Right-In)
+                if color_entry_side is None:
+                    color_entry_side = "left" if left_px > right_px else "right"
+                    print(f"Locked color entry side: {color_entry_side}")
+                
+                err, count, _ = get_line_error(frame) 
+                move_robot(err, count) 
+
+            # Handle "Left-Out/Right-Out" when color is lost but memory is active
+            elif color_entry_side is not None and total_color < 100:
+                print(f"Color lost! Memory Pivot: {color_entry_side}")
+                last_error = -40 if color_entry_side == "left" else 40
+                move_robot(None, 0) # Force pivot in entry direction
+
             else: 
                 detection_frames = 0 
                 err, count, _ = get_line_error(frame) 
                 move_robot(err, count) 
+                
+                # Reset memory after 2 seconds of clean black line following
+                if now > COOLDOWN_UNTIL + 2:
+                    color_entry_side = None
 
         elif current_state == STATE_STOPPED: 
             stop_motors() 
             if now >= stop_until: 
                 if forced_turn_side: 
-                    current_state = STATE_FORCED_TURN 
-                    forced_turn_until = now + 5.0 
+                    current_state = STATE_FORCED_TURN; forced_turn_until = now + 5.0 
                 else: 
-                    COOLDOWN_UNTIL = now + 3.0 
-                    current_state = STATE_FOLLOWING 
+                    COOLDOWN_UNTIL = now + 3.0; current_state = STATE_FOLLOWING 
 
         elif current_state == STATE_FORCED_TURN: 
-            small = cv2.resize(frame, (160, 120)) 
-            hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV) 
+            black_mask = cv2.inRange(hsv, HSV_THRESHOLDS["black"]["low"], HSV_THRESHOLDS["black"]["high"])
+            combined_mask = cv2.bitwise_or(color_mask, black_mask)
+            roi = combined_mask[70:120, 0:80] if forced_turn_side == "left" else combined_mask[70:120, 80:160] 
             
-            m_r1 = cv2.inRange(hsv, HSV_THRESHOLDS["red1"]["low"], HSV_THRESHOLDS["red1"]["high"])
-            m_r2 = cv2.inRange(hsv, HSV_THRESHOLDS["red2"]["low"], HSV_THRESHOLDS["red2"]["high"])
-            m_y = cv2.inRange(hsv, HSV_THRESHOLDS["yellow"]["low"], HSV_THRESHOLDS["yellow"]["high"])
-            mask = cv2.bitwise_or(cv2.bitwise_or(m_r1, m_r2), m_y)
-            
-            roi = mask[70:120, 0:80] if forced_turn_side == "left" else mask[70:120, 80:160] 
-            if cv2.countNonZero(roi) > 400: 
-                forced_turn_side = None 
-                COOLDOWN_UNTIL = now + 2.0 
-                current_state = STATE_FOLLOWING 
+            if cv2.countNonZero(roi) > 500: 
+                print(f"Line acquired on {forced_turn_side}"); forced_turn_side = None 
+                color_entry_side = None # Clear memory after success
+                COOLDOWN_UNTIL = now + 2.0; current_state = STATE_FOLLOWING 
             else: 
-                last_error = -40 if forced_turn_side == "left" else 40 
-                move_robot(None, 0) 
+                last_error = -40 if forced_turn_side == "left" else 40; move_robot(None, 0) 
+            
             if now > forced_turn_until: 
-                forced_turn_side = None 
-                current_state = STATE_FOLLOWING 
+                forced_turn_side = None; current_state = STATE_FOLLOWING
 
         elif current_state == STATE_RECYCLING:
-            last_error = 40 
-            move_robot(None, 0)
+            last_error = 40; move_robot(None, 0)
             if now >= recycle_until:
-                COOLDOWN_UNTIL = now + 2.0
-                current_state = STATE_FOLLOWING
+                COOLDOWN_UNTIL = now + 2.0; current_state = STATE_FOLLOWING
 
         cv2.imshow("View", frame) 
         if cv2.waitKey(1) & 0xFF == ord('q'): break 
